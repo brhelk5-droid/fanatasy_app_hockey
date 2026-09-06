@@ -54,6 +54,14 @@ if connect_clicked and league_id:
 
 league = st.session_state.league
 
+if league is not None:
+    with st.sidebar.expander("Debug: league.settings"):
+        try:
+            settings_dict = vars(league.settings)
+            st.write(settings_dict)
+        except Exception as e:
+            st.write(f"Could not read league.settings: {e}")
+
 
 # ---------------- Shared helpers ----------------
 def player_stat(player, stat_key):
