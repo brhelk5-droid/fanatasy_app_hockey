@@ -64,17 +64,23 @@ def player_stat(player, stat_key):
 
 
 def build_stat_table(players, categories):
+    columns = ["name", "position"] + categories
     rows = []
     for p in players:
         row = {"name": p.name, "position": getattr(p, "position", "")}
         for cat in categories:
             row[cat] = player_stat(p, cat)
         rows.append(row)
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows, columns=columns)
 
 
 def zscore_rank(df, categories):
     df = df.copy()
+    if df.empty:
+        for cat in categories:
+            df[f"z_{cat}"] = pd.Series(dtype=float)
+        df["value"] = pd.Series(dtype=float)
+        return df
     for cat in categories:
         mean, std = df[cat].mean(), df[cat].std(ddof=0)
         if std == 0 or pd.isna(std):
@@ -88,11 +94,16 @@ def zscore_rank(df, categories):
     return df.sort_values("value", ascending=False).reset_index(drop=True)
 
 
+def is_goalie(player):
+    pos = str(getattr(player, "position", "")).strip().lower()
+    return pos in ("g", "goalie", "goaltender")
+
+
 def get_ranked_pool(league, size=1000):
     """Full player pool (used for draft prep -- most players are 'free agents' pre-draft)."""
     pool = league.free_agents(size=size)
-    skaters = [p for p in pool if getattr(p, "position", "") != "G"]
-    goalies = [p for p in pool if getattr(p, "position", "") == "G"]
+    skaters = [p for p in pool if not is_goalie(p)]
+    goalies = [p for p in pool if is_goalie(p)]
     skater_df = zscore_rank(build_stat_table(skaters, SKATER_CATEGORIES), SKATER_CATEGORIES)
     goalie_df = zscore_rank(build_stat_table(goalies, GOALIE_CATEGORIES), GOALIE_CATEGORIES)
     return skater_df, goalie_df
