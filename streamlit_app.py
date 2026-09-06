@@ -20,7 +20,16 @@ st.set_page_config(page_title="Fantasy Hockey Assistant", layout="wide")
 
 SKATER_CATEGORIES = ["G", "A", "+/-", "PPP", "SHP", "SOG", "HIT", "BLK"]
 GOALIE_CATEGORIES = ["W", "GA", "SV", "SO", "OTL"]
-INVERT_CATEGORIES = {"GA", "OTL"}
+
+# Your league's actual point values per stat (Head to Head Points scoring),
+# taken directly from League Settings > Scoring.
+POINT_VALUES = {
+    "G": 6, "A": 4, "+/-": 2, "PPP": 2, "SHP": 4, "SOG": 0.9, "HIT": 0.6, "BLK": 1,
+    # DEF (Defensemen Points) is handled separately in calc_fantasy_points --
+    # it's a defenseman's own G+A scored again at 0.5 pts/point, not a
+    # standalone stat, so it isn't a flat per-stat multiplier here.
+    "W": 5, "GA": -3, "SV": 0.6, "SO": 5, "OTL": 2,
+}
 
 # ---------------- Sidebar: league connection ----------------
 st.sidebar.header("League Connection")
@@ -82,23 +91,27 @@ def build_stat_table(players, categories):
     return pd.DataFrame(rows, columns=columns)
 
 
-def zscore_rank(df, categories):
+def is_defenseman(player):
+    pos = str(getattr(player, "position", "")).strip().upper()
+    return pos in ("D", "DEFENSE", "DEFENSEMAN")
+
+
+def calc_fantasy_points(df, categories):
+    """Compute each player's total fantasy points using the league's real point values.
+
+    Defensemen get an extra DEF bonus: their own Goals + Assists, scored again
+    at 0.5 pts/point (ESPN's "Defensemen Points" category applies only to D
+    and is worth 0 for forwards).
+    """
     df = df.copy()
     if df.empty:
-        for cat in categories:
-            df[f"z_{cat}"] = pd.Series(dtype=float)
         df["value"] = pd.Series(dtype=float)
         return df
-    for cat in categories:
-        mean, std = df[cat].mean(), df[cat].std(ddof=0)
-        if std == 0 or pd.isna(std):
-            df[f"z_{cat}"] = 0.0
-            continue
-        z = (df[cat] - mean) / std
-        if cat in INVERT_CATEGORIES:
-            z = -z
-        df[f"z_{cat}"] = z
-    df["value"] = df[[f"z_{c}" for c in categories]].sum(axis=1)
+    df["value"] = sum(df[cat] * POINT_VALUES[cat] for cat in categories)
+    if "G" in categories and "A" in categories:  # skater table
+        is_def = df["position"].apply(lambda pos: str(pos).strip().upper() in ("D", "DEFENSE", "DEFENSEMAN"))
+        def_bonus = (df["G"] + df["A"]) * 0.5
+        df["value"] = df["value"] + def_bonus.where(is_def, 0)
     return df.sort_values("value", ascending=False).reset_index(drop=True)
 
 
@@ -112,8 +125,8 @@ def get_ranked_pool(league, size=1000):
     pool = league.free_agents(size=size)
     skaters = [p for p in pool if not is_goalie(p)]
     goalies = [p for p in pool if is_goalie(p)]
-    skater_df = zscore_rank(build_stat_table(skaters, SKATER_CATEGORIES), SKATER_CATEGORIES)
-    goalie_df = zscore_rank(build_stat_table(goalies, GOALIE_CATEGORIES), GOALIE_CATEGORIES)
+    skater_df = calc_fantasy_points(build_stat_table(skaters, SKATER_CATEGORIES), SKATER_CATEGORIES)
+    goalie_df = calc_fantasy_points(build_stat_table(goalies, GOALIE_CATEGORIES), GOALIE_CATEGORIES)
     return skater_df, goalie_df
 
 
@@ -123,9 +136,10 @@ tab1, tab2, tab3 = st.tabs(["Draft Helper", "Waiver Wire", "My Team"])
 with tab1:
     st.subheader("Draft Helper")
     st.caption(
-        "Ranks players by category value (z-score across your league's scoring "
-        "categories) using last season's stats. Check off players as they're "
-        "drafted - by anyone - to keep the board current."
+        "Ranks players by projected fantasy points using your league's exact "
+        "point values per stat (Head to Head Points scoring), based on last "
+        "season's totals. Check off players as they're drafted - by anyone - "
+        "to keep the board current."
     )
     if league is None:
         st.info("Connect to your league in the sidebar first.")
@@ -191,8 +205,27 @@ with tab3:
                 league_avg = league_df[cat].sum() / len(league.teams)
                 report_rows.append({
                     "Category": cat,
+                    "Points/Stat": POINT_VALUES[cat],
                     "Your Total": round(my_total, 1),
+                    "Your Fantasy Pts": round(my_total * POINT_VALUES[cat], 1),
                     "League Avg/Team": round(league_avg, 1),
-                    "Note": "lower is better" if cat in INVERT_CATEGORIES else "",
                 })
+
+            # DEF bonus: defensemen's own G+A scored again at 0.5 pts/point
+            is_def = roster_df["position"].apply(
+                lambda pos: str(pos).strip().upper() in ("D", "DEFENSE", "DEFENSEMAN")
+            )
+            my_def_bonus = ((roster_df["G"] + roster_df["A"]) * 0.5 * is_def).sum()
+            league_def_bonus_avg = (
+                (league_df["G"] + league_df["A"]) * 0.5
+                * league_df["position"].apply(lambda pos: str(pos).strip().upper() in ("D", "DEFENSE", "DEFENSEMAN"))
+            ).sum() / len(league.teams)
+            report_rows.append({
+                "Category": "DEF (bonus)",
+                "Points/Stat": 0.5,
+                "Your Total": round(my_def_bonus / 0.5, 1) if my_def_bonus else 0,
+                "Your Fantasy Pts": round(my_def_bonus, 1),
+                "League Avg/Team": round(league_def_bonus_avg, 1),
+            })
+
             st.dataframe(pd.DataFrame(report_rows), use_container_width=True)
