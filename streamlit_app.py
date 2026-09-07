@@ -178,20 +178,31 @@ def compute_utility_adjusted_vorp(skater_df):
 GOALIE_STARTER_SLOTS = 2  # per team, no Utility crossover for goalies
 
 
-def compute_goalie_vorp(goalie_df):
-    """Goalie replacement level: the projected FP of the best goalie who
-    would NOT be a starter across the league (rank = starters*teams + 1),
-    so goalie VORP is on the same footing as skater VORP instead of just
-    being raw points relabeled.
+def fetch_espn_adp(league, size=2000):
+    """Best-effort pull of ESPN's own Average Draft Position per player.
+
+    ESPN's own football API exposes ADP via a player.ownership dict
+    (averageDraftPosition); hockey runs on the same underlying platform, but
+    this library doesn't document whether that field is populated the same
+    way for hockey players, so this tries a few plausible attribute paths
+    and returns whatever it can find -- an empty dict if none work, which
+    the UI treats as "ESPN ADP not available" rather than failing.
     """
-    df = goalie_df.sort_values("value", ascending=False).reset_index(drop=True)
-    replacement_rank = GOALIE_STARTER_SLOTS * LEAGUE_TEAMS  # 0-indexed: this row is the first non-starter
-    if len(df) > replacement_rank:
-        replacement_fp = df.loc[replacement_rank, "value"]
-    else:
-        replacement_fp = df["value"].min() if not df.empty else 0.0
-    df["vorp"] = df["value"] - replacement_fp
-    return df, replacement_fp
+    adp_by_name = {}
+    try:
+        players = league.free_agents(size=size)
+    except Exception:
+        return adp_by_name
+    for p in players:
+        adp = None
+        ownership = getattr(p, "ownership", None)
+        if isinstance(ownership, dict):
+            adp = ownership.get("averageDraftPosition")
+        if adp is None:
+            adp = getattr(p, "average_draft_position", None) or getattr(p, "ave_draft_pos", None)
+        if adp not in (None, 0):
+            adp_by_name[p.name] = adp
+    return adp_by_name
 
 
 @st.cache_data(show_spinner="Loading player projections...")
@@ -199,13 +210,23 @@ def load_projections_from_dataframe(raw_df):
     """Shared parsing logic: takes a raw DataFrame with NAME/POS + stat columns
     (from either the bundled CSV or an uploaded spreadsheet) and returns
     ranked skater/goalie DataFrames plus the Utility-adjusted replacement levels.
+
+    Skaters: VORP is computed here (Utility-adjusted), since the spreadsheet's
+    own VORP ignores this league's Utility slots.
+    Goalies: no Utility crossover applies to them, so we trust the sheet's own
+    VORP directly (it uses a "Draft Based" replacement count reflecting real
+    draft behavior, not just raw roster-slot math) rather than recomputing.
     """
     keep_cols = ["NAME", "POS"] + SKATER_CATEGORIES + GOALIE_CATEGORIES
+    optional_cols = ["GP", "sheet_adp", "sheet_vorp"]
     df = raw_df.copy()
     for col in keep_cols:
         if col not in df.columns:
             df[col] = 0.0
-    df = df[keep_cols].rename(columns={"NAME": "name", "POS": "position"})
+    for col in optional_cols:
+        if col not in df.columns:
+            df[col] = None
+    df = df[keep_cols + optional_cols].rename(columns={"NAME": "name", "POS": "position"})
     df[SKATER_CATEGORIES + GOALIE_CATEGORIES] = df[SKATER_CATEGORIES + GOALIE_CATEGORIES].fillna(0.0)
 
     is_goalie_row = df["position"].astype(str).str.strip().str.upper() == "G"
@@ -217,9 +238,11 @@ def load_projections_from_dataframe(raw_df):
     skater_df = skater_df.sort_values("vorp", ascending=False).reset_index(drop=True)
 
     goalie_df = calc_fantasy_points(df[is_goalie_row].copy().reset_index(drop=True), GOALIE_CATEGORIES)
-    goalie_df, goalie_replacement_fp = compute_goalie_vorp(goalie_df)
+    # Trust the sheet's own VORP for goalies (see docstring) instead of our
+    # own replacement-level recompute.
+    goalie_df["vorp"] = goalie_df["sheet_vorp"].fillna(goalie_df["value"])
     goalie_df = goalie_df.sort_values("vorp", ascending=False).reset_index(drop=True)
-    replacement_levels["G"] = goalie_replacement_fp
+    replacement_levels["G"] = None  # sourced from the sheet, not computed here
 
     return skater_df, goalie_df, replacement_levels
 
