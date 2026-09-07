@@ -115,14 +115,22 @@ def get_ranked_pool_from_espn(league, year, size=1000):
 @st.cache_data(show_spinner="Reading projections...")
 def load_projections(file_bytes):
     """Parse an uploaded 'The List'-style projections workbook into ranked
-    skater/goalie DataFrames using the league's real point values."""
+    skater/goalie DataFrames using the league's real point values.
+
+    Ranking uses the sheet's own VORP (Value Over Replacement Player) column,
+    not raw fantasy points -- VORP accounts for positional scarcity (e.g. a
+    replacement-level defenseman is much worse than a replacement-level
+    forward, and this league starts 4 D), which raw point totals ignore and
+    which otherwise makes defensemen look worse than their true draft value.
+    """
     raw = pd.read_excel(pd.io.common.BytesIO(file_bytes), sheet_name="The List", header=0)
-    keep_cols = ["NAME", "POS"] + SKATER_CATEGORIES + GOALIE_CATEGORIES
+    keep_cols = ["NAME", "POS", "VORP"] + SKATER_CATEGORIES + GOALIE_CATEGORIES
     for col in keep_cols:
         if col not in raw.columns:
             raw[col] = 0.0
-    df = raw[keep_cols].rename(columns={"NAME": "name", "POS": "position"})
+    df = raw[keep_cols].rename(columns={"NAME": "name", "POS": "position", "VORP": "vorp"})
     df[SKATER_CATEGORIES + GOALIE_CATEGORIES] = df[SKATER_CATEGORIES + GOALIE_CATEGORIES].fillna(0.0)
+    df["vorp"] = df["vorp"].fillna(0.0)
 
     # Goalies are rows whose position is exactly "G" (multi-position skaters
     # in this sheet's format look like "C,LW,RW" and never include G).
@@ -130,6 +138,9 @@ def load_projections(file_bytes):
 
     skater_df = calc_fantasy_points(df[~is_goalie_row].copy().reset_index(drop=True), SKATER_CATEGORIES)
     goalie_df = calc_fantasy_points(df[is_goalie_row].copy().reset_index(drop=True), GOALIE_CATEGORIES)
+    # Re-rank by VORP (draft value) rather than raw fantasy points.
+    skater_df = skater_df.sort_values("vorp", ascending=False).reset_index(drop=True)
+    goalie_df = goalie_df.sort_values("vorp", ascending=False).reset_index(drop=True)
     return skater_df, goalie_df
 
 
@@ -237,9 +248,15 @@ with tab1:
             with cols[1]:
                 st.write(f"**{row['name']}** ({row['position']})")
             with cols[2]:
-                st.write(f"Value: {row['value']:.2f}")
+                if "vorp" in row:
+                    st.write(f"VORP: {row['vorp']:.1f}")
+                else:
+                    st.write(f"Value: {row['value']:.2f}")
             with cols[3]:
-                st.write("")
+                if "vorp" in row:
+                    st.write(f"FP: {row['value']:.0f}")
+                else:
+                    st.write("")
             with cols[4]:
                 cats = SKATER_CATEGORIES if pos_filter == "Skaters" else GOALIE_CATEGORIES
                 st.write(" | ".join(f"{c}: {row[c]:.0f}" for c in cats))
