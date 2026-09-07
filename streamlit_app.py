@@ -16,6 +16,7 @@ Built for Smith's Hockey League (ESPN, Head to Head Points scoring):
 
 import streamlit as st
 import pandas as pd
+import os
 from espn_api.hockey import League
 
 st.set_page_config(page_title="Fantasy Hockey Assistant", layout="wide")
@@ -112,55 +113,138 @@ def get_ranked_pool_from_espn(league, year, size=1000):
     return skater_df, goalie_df
 
 
-@st.cache_data(show_spinner="Reading projections...")
-def load_projections(file_bytes):
-    """Parse an uploaded 'The List'-style projections workbook into ranked
-    skater/goalie DataFrames using the league's real point values.
+# Your league's actual roster construction (used to compute a Utility-aware
+# replacement level -- see compute_utility_adjusted_vorp below).
+LEAGUE_TEAMS = 14
+DEDICATED_SKATER_SLOTS = {"C": 2, "LW": 2, "RW": 2, "D": 4}  # starters per team
+UTIL_SLOTS_PER_TEAM = 2  # Utility: any skater position is eligible
 
-    Ranking uses the sheet's own VORP (Value Over Replacement Player) column,
-    not raw fantasy points -- VORP accounts for positional scarcity (e.g. a
-    replacement-level defenseman is much worse than a replacement-level
-    forward, and this league starts 4 D), which raw point totals ignore and
-    which otherwise makes defensemen look worse than their true draft value.
+
+def eligible_positions(position_str):
+    return [p.strip().upper() for p in str(position_str).split(",") if p.strip()]
+
+
+def compute_utility_adjusted_vorp(skater_df):
+    """Replacement level per position, accounting for Utility slots.
+
+    The projections sheet's own VORP column assumes only dedicated
+    position slots exist (2 C / 2 LW / 2 RW / 4 D per team) and has no
+    concept of Utility -- but this league also starts 2 Utility skaters
+    per team (any position eligible), which is 28 extra league-wide skater
+    slots the sheet's replacement level never accounts for. Ignoring them
+    makes the replacement level too shallow a talent pool overall, which
+    understates true draft value -- defensemen most visibly, since they're
+    already scarcer at their dedicated slots.
+
+    This does a simple greedy fill: rank all skaters by raw fantasy points,
+    assign each to their scarcest open dedicated position first, then to a
+    Utility slot if no dedicated room remains, then whatever's left over
+    marks the replacement level for each position it's eligible for.
     """
-    raw = pd.read_excel(pd.io.common.BytesIO(file_bytes), sheet_name="The List", header=0)
-    keep_cols = ["NAME", "POS", "VORP"] + SKATER_CATEGORIES + GOALIE_CATEGORIES
-    for col in keep_cols:
-        if col not in raw.columns:
-            raw[col] = 0.0
-    df = raw[keep_cols].rename(columns={"NAME": "name", "POS": "position", "VORP": "vorp"})
-    df[SKATER_CATEGORIES + GOALIE_CATEGORIES] = df[SKATER_CATEGORIES + GOALIE_CATEGORIES].fillna(0.0)
-    df["vorp"] = df["vorp"].fillna(0.0)
+    df = skater_df.sort_values("fp", ascending=False).reset_index(drop=True)
+    dedicated_capacity = {p: n * LEAGUE_TEAMS for p, n in DEDICATED_SKATER_SLOTS.items()}
+    util_capacity = UTIL_SLOTS_PER_TEAM * LEAGUE_TEAMS
+    filled = {p: 0 for p in dedicated_capacity}
+    filled_util = 0
+    replacement_fp = {}
 
-    # Goalies are rows whose position is exactly "G" (multi-position skaters
-    # in this sheet's format look like "C,LW,RW" and never include G).
+    for _, row in df.iterrows():
+        elig = [p for p in eligible_positions(row["position"]) if p in dedicated_capacity]
+        open_positions = sorted(
+            (p for p in elig if filled[p] < dedicated_capacity[p]),
+            key=lambda p: dedicated_capacity[p] - filled[p],
+        )
+        if open_positions:
+            filled[open_positions[0]] += 1
+        elif filled_util < util_capacity:
+            filled_util += 1
+        else:
+            for p in elig:
+                if p not in replacement_fp:
+                    replacement_fp[p] = row["fp"]
+        if len(replacement_fp) == len(dedicated_capacity):
+            break
+
+    def vorp_for(row):
+        elig = [p for p in eligible_positions(row["position"]) if p in replacement_fp]
+        if not elig:
+            return row["fp"]  # shouldn't happen, but don't crash
+        return row["fp"] - min(replacement_fp[p] for p in elig)
+
+    df["vorp"] = df.apply(vorp_for, axis=1)
+    return df, replacement_fp
+
+
+@st.cache_data(show_spinner="Loading player projections...")
+def load_projections_from_dataframe(raw_df):
+    """Shared parsing logic: takes a raw DataFrame with NAME/POS + stat columns
+    (from either the bundled CSV or an uploaded spreadsheet) and returns
+    ranked skater/goalie DataFrames plus the Utility-adjusted replacement levels.
+    """
+    keep_cols = ["NAME", "POS"] + SKATER_CATEGORIES + GOALIE_CATEGORIES
+    df = raw_df.copy()
+    for col in keep_cols:
+        if col not in df.columns:
+            df[col] = 0.0
+    df = df[keep_cols].rename(columns={"NAME": "name", "POS": "position"})
+    df[SKATER_CATEGORIES + GOALIE_CATEGORIES] = df[SKATER_CATEGORIES + GOALIE_CATEGORIES].fillna(0.0)
+
     is_goalie_row = df["position"].astype(str).str.strip().str.upper() == "G"
 
     skater_df = calc_fantasy_points(df[~is_goalie_row].copy().reset_index(drop=True), SKATER_CATEGORIES)
-    goalie_df = calc_fantasy_points(df[is_goalie_row].copy().reset_index(drop=True), GOALIE_CATEGORIES)
-    # Re-rank by VORP (draft value) rather than raw fantasy points.
+    skater_df = skater_df.rename(columns={"value": "fp"})
+    skater_df, replacement_levels = compute_utility_adjusted_vorp(skater_df)
+    skater_df = skater_df.rename(columns={"fp": "value"})
     skater_df = skater_df.sort_values("vorp", ascending=False).reset_index(drop=True)
+
+    goalie_df = calc_fantasy_points(df[is_goalie_row].copy().reset_index(drop=True), GOALIE_CATEGORIES)
+    goalie_df["vorp"] = goalie_df["value"]
     goalie_df = goalie_df.sort_values("vorp", ascending=False).reset_index(drop=True)
-    return skater_df, goalie_df
+
+    return skater_df, goalie_df, replacement_levels
 
 
-# ---------------- Sidebar: projections file ----------------
+BUNDLED_PROJECTIONS_PATH = "player_projections.csv"
+
+
+@st.cache_data(show_spinner="Loading player projections...")
+def load_bundled_projections():
+    raw_df = pd.read_csv(BUNDLED_PROJECTIONS_PATH)
+    return load_projections_from_dataframe(raw_df)
+
+
+def load_projections_from_upload(file_bytes):
+    raw_df = pd.read_excel(pd.io.common.BytesIO(file_bytes), sheet_name="The List", header=0)
+    return load_projections_from_dataframe(raw_df)
+
+
+# ---------------- Sidebar: projections ----------------
 st.sidebar.header("Player Projections")
-projections_file = st.sidebar.file_uploader(
-    "Upload projections spreadsheet (.xlsx)",
-    type=["xlsx"],
-    help="Expects a 'The List' sheet with columns: NAME, POS, G, A, +/-, PPP, SHP, SOG, HIT, BLK, W, GA, SV, SO, OTL",
-)
 
 projections_loaded = False
-proj_skater_df, proj_goalie_df = pd.DataFrame(), pd.DataFrame()
-if projections_file is not None:
+proj_skater_df, proj_goalie_df, proj_replacement_levels = pd.DataFrame(), pd.DataFrame(), {}
+
+if os.path.exists(BUNDLED_PROJECTIONS_PATH):
     try:
-        proj_skater_df, proj_goalie_df = load_projections(projections_file.getvalue())
+        proj_skater_df, proj_goalie_df, proj_replacement_levels = load_bundled_projections()
         projections_loaded = True
-        st.sidebar.success(f"Loaded {len(proj_skater_df) + len(proj_goalie_df)} players")
+        st.sidebar.success(f"Loaded {len(proj_skater_df) + len(proj_goalie_df)} players from bundled projections")
     except Exception as e:
-        st.sidebar.error(f"Could not read projections file: {e}")
+        st.sidebar.error(f"Could not read bundled projections: {e}")
+
+with st.sidebar.expander("Update projections (optional)"):
+    projections_file = st.file_uploader(
+        "Upload a newer projections spreadsheet (.xlsx)",
+        type=["xlsx"],
+        help="Expects a 'The List' sheet with columns: NAME, POS, G, A, +/-, PPP, SHP, SOG, HIT, BLK, W, GA, SV, SO, OTL",
+    )
+    if projections_file is not None:
+        try:
+            proj_skater_df, proj_goalie_df, proj_replacement_levels = load_projections_from_upload(projections_file.getvalue())
+            projections_loaded = True
+            st.success(f"Loaded {len(proj_skater_df) + len(proj_goalie_df)} players from upload (overriding bundled file)")
+        except Exception as e:
+            st.error(f"Could not read projections file: {e}")
 
 # ---------------- Sidebar: league connection ----------------
 st.sidebar.header("League Connection")
@@ -211,10 +295,23 @@ with tab1:
 
     if projections_loaded:
         st.caption(
-            "Ranks players by projected fantasy points using your uploaded "
-            "2026-27 projections and your league's exact point values per stat. "
+            "Ranks players by VORP (Value Over Replacement Player), computed from "
+            "your uploaded 2026-27 projections using your league's exact point "
+            "values -- and adjusted for your league's 2 Utility slots per team, "
+            "which the spreadsheet's own VORP column doesn't account for. "
             "Check off players as they're drafted - by anyone - to keep the board current."
         )
+        if proj_replacement_levels:
+            with st.expander("Replacement level by position (Utility-adjusted)"):
+                st.write(
+                    {pos: round(fp, 1) for pos, fp in sorted(proj_replacement_levels.items())}
+                )
+                st.caption(
+                    "This is the projected fantasy points of the best player at each "
+                    "position who would NOT make a starting lineup across the league, "
+                    "once Utility slots are filled too. Lower than the spreadsheet's "
+                    "own numbers because Utility slots make the draftable pool deeper."
+                )
         skater_df, goalie_df = proj_skater_df, proj_goalie_df
         data_source_ready = True
     elif league is not None:
