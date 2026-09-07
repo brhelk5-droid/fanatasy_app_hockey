@@ -288,12 +288,19 @@ st.sidebar.header("Player Projections")
 
 projections_loaded = False
 proj_skater_df, proj_goalie_df, proj_replacement_levels = pd.DataFrame(), pd.DataFrame(), {}
+proj_missing_cols = []
 
 if os.path.exists(BUNDLED_PROJECTIONS_PATH):
     try:
-        proj_skater_df, proj_goalie_df, proj_replacement_levels = load_bundled_projections()
+        proj_skater_df, proj_goalie_df, proj_replacement_levels, proj_missing_cols = load_bundled_projections()
         projections_loaded = True
         st.sidebar.success(f"Loaded {len(proj_skater_df) + len(proj_goalie_df)} players from bundled projections")
+        if proj_missing_cols:
+            st.sidebar.warning(
+                f"Your player_projections.csv is missing columns: {', '.join(proj_missing_cols)}. "
+                "This looks like an older version of the file -- re-upload the latest CSV to GitHub "
+                "to get ADP, GP, and correct goalie rankings back."
+            )
     except Exception as e:
         st.sidebar.error(f"Could not read bundled projections: {e}")
 
@@ -305,7 +312,7 @@ with st.sidebar.expander("Update projections (optional)"):
     )
     if projections_file is not None:
         try:
-            proj_skater_df, proj_goalie_df, proj_replacement_levels = load_projections_from_upload(projections_file.getvalue())
+            proj_skater_df, proj_goalie_df, proj_replacement_levels, proj_missing_cols = load_projections_from_upload(projections_file.getvalue())
             projections_loaded = True
             st.success(f"Loaded {len(proj_skater_df) + len(proj_goalie_df)} players from upload (overriding bundled file)")
         except Exception as e:
