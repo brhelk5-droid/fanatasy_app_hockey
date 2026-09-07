@@ -1,3 +1,4 @@
 streamlit
 pandas
 espn_api
+openpyxl
