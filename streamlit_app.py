@@ -202,6 +202,26 @@ def fetch_espn_adp(league, size=2000):
     return adp_by_name
 
 
+GOALIE_STARTER_SLOTS = 2  # per team, no Utility crossover for goalies
+
+
+def compute_goalie_vorp_fallback(goalie_df):
+    """Fallback goalie replacement level when the sheet's own VORP isn't
+    available: the projected FP of the best goalie who would NOT be a
+    starter across the league (rank = starters*teams + 1). Used only when
+    sheet_vorp is missing -- never silently substitute raw FP as "VORP",
+    since goalies' raw point totals are on a different scale than
+    already-baselined skater VORP and would wrongly float to the top.
+    """
+    df = goalie_df.sort_values("value", ascending=False).reset_index(drop=True)
+    replacement_rank = GOALIE_STARTER_SLOTS * LEAGUE_TEAMS
+    if len(df) > replacement_rank:
+        replacement_fp = df.loc[replacement_rank, "value"]
+    else:
+        replacement_fp = df["value"].min() if not df.empty else 0.0
+    return df["value"] - replacement_fp
+
+
 @st.cache_data(show_spinner="Loading player projections...")
 def load_projections_from_dataframe(raw_df):
     """Shared parsing logic: takes a raw DataFrame with NAME/POS + stat columns
@@ -212,10 +232,12 @@ def load_projections_from_dataframe(raw_df):
     own VORP ignores this league's Utility slots.
     Goalies: no Utility crossover applies to them, so we trust the sheet's own
     VORP directly (it uses a "Draft Based" replacement count reflecting real
-    draft behavior, not just raw roster-slot math) rather than recomputing.
+    draft behavior, not just raw roster-slot math) rather than recomputing --
+    but only if that column is actually present; see compute_goalie_vorp_fallback.
     """
     keep_cols = ["NAME", "POS"] + SKATER_CATEGORIES + GOALIE_CATEGORIES
-    optional_cols = ["GP", "sheet_adp", "sheet_vorp"]
+    optional_cols = ["GP", "sheet_adp", "sheet_vorp", "analyst_adj"]
+    missing_optional_cols = [c for c in optional_cols if c not in raw_df.columns]
     df = raw_df.copy()
     for col in keep_cols:
         if col not in df.columns:
@@ -225,6 +247,8 @@ def load_projections_from_dataframe(raw_df):
             df[col] = None
     df = df[keep_cols + optional_cols].rename(columns={"NAME": "name", "POS": "position"})
     df[SKATER_CATEGORIES + GOALIE_CATEGORIES] = df[SKATER_CATEGORIES + GOALIE_CATEGORIES].fillna(0.0)
+    for numeric_col in ["GP", "sheet_adp", "sheet_vorp"]:
+        df[numeric_col] = pd.to_numeric(df[numeric_col], errors="coerce")
 
     is_goalie_row = df["position"].astype(str).str.strip().str.upper() == "G"
 
@@ -235,13 +259,14 @@ def load_projections_from_dataframe(raw_df):
     skater_df = skater_df.sort_values("vorp", ascending=False).reset_index(drop=True)
 
     goalie_df = calc_fantasy_points(df[is_goalie_row].copy().reset_index(drop=True), GOALIE_CATEGORIES)
-    # Trust the sheet's own VORP for goalies (see docstring) instead of our
-    # own replacement-level recompute.
-    goalie_df["vorp"] = goalie_df["sheet_vorp"].fillna(goalie_df["value"])
+    if goalie_df["sheet_vorp"].notna().any():
+        goalie_df["vorp"] = goalie_df["sheet_vorp"].fillna(compute_goalie_vorp_fallback(goalie_df))
+    else:
+        goalie_df["vorp"] = compute_goalie_vorp_fallback(goalie_df)
     goalie_df = goalie_df.sort_values("vorp", ascending=False).reset_index(drop=True)
-    replacement_levels["G"] = None  # sourced from the sheet, not computed here
+    replacement_levels["G"] = None  # sourced from the sheet when available
 
-    return skater_df, goalie_df, replacement_levels
+    return skater_df, goalie_df, replacement_levels, missing_optional_cols
 
 
 BUNDLED_PROJECTIONS_PATH = "player_projections.csv"
@@ -403,6 +428,14 @@ with tab1:
             combined_df["adp"] = None
             combined_df["adp_source"] = None
 
+        # Value/reach flag: compare each player's rank in OUR VORP-based board
+        # (already Utility-adjusted, unlike the sheet's own rank) against their
+        # ADP. A player going much later than our rank suggests is a "value";
+        # much earlier is a "reach." Same idea as the source spreadsheet's own
+        # ADP Difference column, just computed against our corrected ranking.
+        combined_df["our_rank"] = combined_df["vorp"].rank(ascending=False, method="min")
+        combined_df["adp_diff"] = combined_df["adp"] - combined_df["our_rank"]
+
         available_df = combined_df[~combined_df["name"].isin(st.session_state.drafted_names)]
 
         ALL_POSITIONS = ["C", "LW", "RW", "D", "G"]
@@ -421,13 +454,15 @@ with tab1:
 
         st.write(f"**{len(available_df)} players {'matching search/filter' if (search_term or len(selected_positions) < len(ALL_POSITIONS)) else 'still available'}**")
         for _, row in available_df.head(40).iterrows():
-            cols = st.columns([0.5, 2.5, 1, 1, 1.3, 1, 4])
+            cols = st.columns([0.5, 2.3, 1, 1, 1.3, 0.8, 1.2, 3.5])
             with cols[0]:
                 if st.button("Draft", key=f"draft_{row['name']}"):
                     st.session_state.drafted_names.add(row["name"])
                     st.rerun()
             with cols[1]:
-                st.write(f"**{row['name']}** ({row['position_display']})")
+                adj = row.get("analyst_adj")
+                adj_badge = f" {adj.strip()}" if isinstance(adj, str) and adj.strip() else ""
+                st.write(f"**{row['name']}**{adj_badge} ({row['position_display']})")
             with cols[2]:
                 st.write(f"VORP: {row['vorp']:.1f}")
             with cols[3]:
@@ -442,6 +477,17 @@ with tab1:
                 gp = row.get("GP")
                 st.write(f"GP: {gp:.0f}" if pd.notna(gp) else "GP: n/a")
             with cols[6]:
+                diff = row.get("adp_diff")
+                if pd.notna(diff):
+                    if diff >= 15:
+                        st.write(f"🔥 Value (+{diff:.0f})")
+                    elif diff <= -15:
+                        st.write(f"⚠️ Reach ({diff:.0f})")
+                    else:
+                        st.write(f"{diff:+.0f}")
+                else:
+                    st.write("")
+            with cols[7]:
                 is_goalie_row = str(row["position"]).strip().upper() == "G"
                 cats = GOALIE_CATEGORIES if is_goalie_row else SKATER_CATEGORIES
                 st.write(" | ".join(f"{c}: {row[c]:.0f}" for c in cats))
