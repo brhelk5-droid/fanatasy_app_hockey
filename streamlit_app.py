@@ -385,13 +385,15 @@ with tab1:
         if proj_replacement_levels:
             with st.expander("Replacement level by position (Utility-adjusted)"):
                 st.write(
-                    {pos: round(fp, 1) for pos, fp in sorted(proj_replacement_levels.items())}
+                    {pos: round(fp, 1) for pos, fp in sorted(proj_replacement_levels.items()) if fp is not None}
                 )
                 st.caption(
                     "This is the projected fantasy points of the best player at each "
                     "position who would NOT make a starting lineup across the league, "
                     "once Utility slots are filled too. Lower than the spreadsheet's "
-                    "own numbers because Utility slots make the draftable pool deeper."
+                    "own numbers because Utility slots make the draftable pool deeper. "
+                    "Goalies aren't shown here -- they don't share Utility slots with "
+                    "skaters, so their replacement level is sourced separately."
                 )
         skater_df, goalie_df = proj_skater_df, proj_goalie_df
         data_source_ready = True
