@@ -175,6 +175,25 @@ def compute_utility_adjusted_vorp(skater_df):
     return df, replacement_fp
 
 
+GOALIE_STARTER_SLOTS = 2  # per team, no Utility crossover for goalies
+
+
+def compute_goalie_vorp(goalie_df):
+    """Goalie replacement level: the projected FP of the best goalie who
+    would NOT be a starter across the league (rank = starters*teams + 1),
+    so goalie VORP is on the same footing as skater VORP instead of just
+    being raw points relabeled.
+    """
+    df = goalie_df.sort_values("value", ascending=False).reset_index(drop=True)
+    replacement_rank = GOALIE_STARTER_SLOTS * LEAGUE_TEAMS  # 0-indexed: this row is the first non-starter
+    if len(df) > replacement_rank:
+        replacement_fp = df.loc[replacement_rank, "value"]
+    else:
+        replacement_fp = df["value"].min() if not df.empty else 0.0
+    df["vorp"] = df["value"] - replacement_fp
+    return df, replacement_fp
+
+
 @st.cache_data(show_spinner="Loading player projections...")
 def load_projections_from_dataframe(raw_df):
     """Shared parsing logic: takes a raw DataFrame with NAME/POS + stat columns
@@ -198,8 +217,9 @@ def load_projections_from_dataframe(raw_df):
     skater_df = skater_df.sort_values("vorp", ascending=False).reset_index(drop=True)
 
     goalie_df = calc_fantasy_points(df[is_goalie_row].copy().reset_index(drop=True), GOALIE_CATEGORIES)
-    goalie_df["vorp"] = goalie_df["value"]
+    goalie_df, goalie_replacement_fp = compute_goalie_vorp(goalie_df)
     goalie_df = goalie_df.sort_values("vorp", ascending=False).reset_index(drop=True)
+    replacement_levels["G"] = goalie_replacement_fp
 
     return skater_df, goalie_df, replacement_levels
 
@@ -321,21 +341,37 @@ with tab1:
             "sidebar for more accurate, forward-looking rankings."
         )
         skater_df, goalie_df = get_ranked_pool_from_espn(league, year)
+        skater_df["vorp"] = skater_df["value"]  # no VORP model for the ESPN fallback path
+        goalie_df["vorp"] = goalie_df["value"]
         data_source_ready = True
     else:
         st.info("Upload a projections spreadsheet, or connect to your league, in the sidebar.")
         data_source_ready = False
 
     if data_source_ready:
-        pos_filter = st.radio("Position", ["Skaters", "Goalies"], horizontal=True)
-        df = skater_df if pos_filter == "Skaters" else goalie_df
-        available_df = df[~df["name"].isin(st.session_state.drafted_names)]
+        # Combine skaters and goalies into one board, ranked on the same VORP scale.
+        combined_df = pd.concat([skater_df, goalie_df], ignore_index=True, sort=False)
+        combined_df = combined_df.sort_values("vorp", ascending=False).reset_index(drop=True)
+        # Display multi-position eligibility as "LW/RW" instead of "LW,RW"
+        combined_df["position_display"] = combined_df["position"].astype(str).str.replace(",", "/")
+
+        available_df = combined_df[~combined_df["name"].isin(st.session_state.drafted_names)]
+
+        ALL_POSITIONS = ["C", "LW", "RW", "D", "G"]
+        selected_positions = st.multiselect(
+            "Positions to show", ALL_POSITIONS, default=ALL_POSITIONS
+        )
+        if selected_positions:
+            def matches_position_filter(pos_str):
+                elig = [p.strip().upper() for p in str(pos_str).split(",")]
+                return any(p in selected_positions for p in elig)
+            available_df = available_df[available_df["position"].apply(matches_position_filter)]
 
         search_term = st.text_input("Search players", value="", placeholder="Type a player name...")
         if search_term:
             available_df = available_df[available_df["name"].str.contains(search_term, case=False, na=False)]
 
-        st.write(f"**{len(available_df)} players {'matching search' if search_term else 'still available'}**")
+        st.write(f"**{len(available_df)} players {'matching search/filter' if (search_term or len(selected_positions) < len(ALL_POSITIONS)) else 'still available'}**")
         for _, row in available_df.head(40).iterrows():
             cols = st.columns([0.5, 3, 1, 1, 5])
             with cols[0]:
@@ -343,19 +379,14 @@ with tab1:
                     st.session_state.drafted_names.add(row["name"])
                     st.rerun()
             with cols[1]:
-                st.write(f"**{row['name']}** ({row['position']})")
+                st.write(f"**{row['name']}** ({row['position_display']})")
             with cols[2]:
-                if "vorp" in row:
-                    st.write(f"VORP: {row['vorp']:.1f}")
-                else:
-                    st.write(f"Value: {row['value']:.2f}")
+                st.write(f"VORP: {row['vorp']:.1f}")
             with cols[3]:
-                if "vorp" in row:
-                    st.write(f"FP: {row['value']:.0f}")
-                else:
-                    st.write("")
+                st.write(f"FP: {row['value']:.0f}")
             with cols[4]:
-                cats = SKATER_CATEGORIES if pos_filter == "Skaters" else GOALIE_CATEGORIES
+                is_goalie_row = str(row["position"]).strip().upper() == "G"
+                cats = GOALIE_CATEGORIES if is_goalie_row else SKATER_CATEGORIES
                 st.write(" | ".join(f"{c}: {row[c]:.0f}" for c in cats))
 
         if st.session_state.drafted_names:
