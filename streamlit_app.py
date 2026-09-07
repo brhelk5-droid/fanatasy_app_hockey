@@ -3,13 +3,15 @@ Fantasy Hockey Assistant - Streamlit App
 =========================================
 Three tools in one app:
   1. Draft Helper  - rank the full player pool before/during your draft,
-                      check players off as they're picked (by you or others)
+                      using real 2026-27 projections (uploaded spreadsheet)
+                      if provided, falling back to ESPN free-agent data.
+                      Check players off as they're picked (by you or others).
   2. Waiver Wire    - rank current free agents after the season starts
   3. My Team        - category strengths/weaknesses vs. league average
 
-Built for an ESPN category-based league:
-  Skaters: G, A, +/-, PPP, SHP, SOG, HIT, BLK
-  Goalies: W, GA, SV, SO, OTL   (GA and OTL are "lower is better")
+Built for Smith's Hockey League (ESPN, Head to Head Points scoring):
+  Skaters: G, A, +/-, PPP, SHP, SOG, HIT, BLK  (+ DEF bonus for defensemen)
+  Goalies: W, GA, SV, SO, OTL
 """
 
 import streamlit as st
@@ -30,6 +32,124 @@ POINT_VALUES = {
     # standalone stat, so it isn't a flat per-stat multiplier here.
     "W": 5, "GA": -3, "SV": 0.6, "SO": 5, "OTL": 2,
 }
+
+
+# ---------------- Shared helpers ----------------
+def is_defenseman_label(pos):
+    return str(pos).strip().upper() in ("D", "DEFENSE", "DEFENSEMAN")
+
+
+def calc_fantasy_points(df, categories):
+    """Compute each player's total fantasy points using the league's real point values.
+
+    Defensemen get an extra DEF bonus: their own Goals + Assists, scored again
+    at 0.5 pts/point (ESPN's "Defensemen Points" category applies only to D
+    and is worth 0 for forwards).
+    """
+    df = df.copy()
+    if df.empty:
+        df["value"] = pd.Series(dtype=float)
+        return df
+    df["value"] = sum(df[cat] * POINT_VALUES[cat] for cat in categories)
+    if "G" in categories and "A" in categories:  # skater table
+        is_def = df["position"].apply(is_defenseman_label)
+        def_bonus = (df["G"] + df["A"]) * 0.5
+        df["value"] = df["value"] + def_bonus.where(is_def, 0)
+    return df.sort_values("value", ascending=False).reset_index(drop=True)
+
+
+def is_goalie(player):
+    pos = str(getattr(player, "position", "")).strip().lower()
+    return pos in ("g", "goalie", "goaltender")
+
+
+def get_stats_dict(player, year):
+    """Return the stat totals dict to use for ESPN-based projections.
+
+    Since a season with no games played yet has all-zero 'total' stats
+    (true for any league before its draft/season start), this prefers the
+    previous season's actual totals as the projection baseline, falling
+    back to whatever 'total'-like key is available.
+    """
+    stats = getattr(player, "stats", {}) or {}
+    prev_year = int(year) - 1
+    for key in stats.keys():
+        if str(prev_year) in str(key) and "total" in str(key).lower():
+            return stats[key] or {}
+    for key in stats.keys():
+        if "total" in str(key).lower():
+            return stats[key] or {}
+    return stats.get("total", {}) or {}
+
+
+def player_stat(stats_dict, stat_key):
+    try:
+        return float(stats_dict.get(stat_key, 0) or 0)
+    except (AttributeError, TypeError):
+        return 0.0
+
+
+def build_stat_table_from_espn(players, categories, year):
+    columns = ["name", "position"] + categories
+    rows = []
+    for p in players:
+        stats_dict = get_stats_dict(p, year)
+        row = {"name": p.name, "position": getattr(p, "position", "")}
+        for cat in categories:
+            row[cat] = player_stat(stats_dict, cat)
+        rows.append(row)
+    return pd.DataFrame(rows, columns=columns)
+
+
+def get_ranked_pool_from_espn(league, year, size=1000):
+    """Fallback: full player pool ranked from ESPN's own stats (used when no
+    projections spreadsheet has been uploaded)."""
+    pool = league.free_agents(size=size)
+    skaters = [p for p in pool if not is_goalie(p)]
+    goalies = [p for p in pool if is_goalie(p)]
+    skater_df = calc_fantasy_points(build_stat_table_from_espn(skaters, SKATER_CATEGORIES, year), SKATER_CATEGORIES)
+    goalie_df = calc_fantasy_points(build_stat_table_from_espn(goalies, GOALIE_CATEGORIES, year), GOALIE_CATEGORIES)
+    return skater_df, goalie_df
+
+
+@st.cache_data(show_spinner="Reading projections...")
+def load_projections(file_bytes):
+    """Parse an uploaded 'The List'-style projections workbook into ranked
+    skater/goalie DataFrames using the league's real point values."""
+    raw = pd.read_excel(pd.io.common.BytesIO(file_bytes), sheet_name="The List", header=0)
+    keep_cols = ["NAME", "POS"] + SKATER_CATEGORIES + GOALIE_CATEGORIES
+    for col in keep_cols:
+        if col not in raw.columns:
+            raw[col] = 0.0
+    df = raw[keep_cols].rename(columns={"NAME": "name", "POS": "position"})
+    df[SKATER_CATEGORIES + GOALIE_CATEGORIES] = df[SKATER_CATEGORIES + GOALIE_CATEGORIES].fillna(0.0)
+
+    # Goalies are rows whose position is exactly "G" (multi-position skaters
+    # in this sheet's format look like "C,LW,RW" and never include G).
+    is_goalie_row = df["position"].astype(str).str.strip().str.upper() == "G"
+
+    skater_df = calc_fantasy_points(df[~is_goalie_row].copy().reset_index(drop=True), SKATER_CATEGORIES)
+    goalie_df = calc_fantasy_points(df[is_goalie_row].copy().reset_index(drop=True), GOALIE_CATEGORIES)
+    return skater_df, goalie_df
+
+
+# ---------------- Sidebar: projections file ----------------
+st.sidebar.header("Player Projections")
+projections_file = st.sidebar.file_uploader(
+    "Upload projections spreadsheet (.xlsx)",
+    type=["xlsx"],
+    help="Expects a 'The List' sheet with columns: NAME, POS, G, A, +/-, PPP, SHP, SOG, HIT, BLK, W, GA, SV, SO, OTL",
+)
+
+projections_loaded = False
+proj_skater_df, proj_goalie_df = pd.DataFrame(), pd.DataFrame()
+if projections_file is not None:
+    try:
+        proj_skater_df, proj_goalie_df = load_projections(projections_file.getvalue())
+        projections_loaded = True
+        st.sidebar.success(f"Loaded {len(proj_skater_df) + len(proj_goalie_df)} players")
+    except Exception as e:
+        st.sidebar.error(f"Could not read projections file: {e}")
 
 # ---------------- Sidebar: league connection ----------------
 st.sidebar.header("League Connection")
@@ -72,84 +192,42 @@ if league is not None:
             st.write(f"Could not read league.settings: {e}")
 
 
-# ---------------- Shared helpers ----------------
-def player_stat(player, stat_key):
-    try:
-        return float(player.stats.get("total", {}).get(stat_key, 0) or 0)
-    except (AttributeError, TypeError):
-        return 0.0
-
-
-def build_stat_table(players, categories):
-    columns = ["name", "position"] + categories
-    rows = []
-    for p in players:
-        row = {"name": p.name, "position": getattr(p, "position", "")}
-        for cat in categories:
-            row[cat] = player_stat(p, cat)
-        rows.append(row)
-    return pd.DataFrame(rows, columns=columns)
-
-
-def is_defenseman(player):
-    pos = str(getattr(player, "position", "")).strip().upper()
-    return pos in ("D", "DEFENSE", "DEFENSEMAN")
-
-
-def calc_fantasy_points(df, categories):
-    """Compute each player's total fantasy points using the league's real point values.
-
-    Defensemen get an extra DEF bonus: their own Goals + Assists, scored again
-    at 0.5 pts/point (ESPN's "Defensemen Points" category applies only to D
-    and is worth 0 for forwards).
-    """
-    df = df.copy()
-    if df.empty:
-        df["value"] = pd.Series(dtype=float)
-        return df
-    df["value"] = sum(df[cat] * POINT_VALUES[cat] for cat in categories)
-    if "G" in categories and "A" in categories:  # skater table
-        is_def = df["position"].apply(lambda pos: str(pos).strip().upper() in ("D", "DEFENSE", "DEFENSEMAN"))
-        def_bonus = (df["G"] + df["A"]) * 0.5
-        df["value"] = df["value"] + def_bonus.where(is_def, 0)
-    return df.sort_values("value", ascending=False).reset_index(drop=True)
-
-
-def is_goalie(player):
-    pos = str(getattr(player, "position", "")).strip().lower()
-    return pos in ("g", "goalie", "goaltender")
-
-
-def get_ranked_pool(league, size=1000):
-    """Full player pool (used for draft prep -- most players are 'free agents' pre-draft)."""
-    pool = league.free_agents(size=size)
-    skaters = [p for p in pool if not is_goalie(p)]
-    goalies = [p for p in pool if is_goalie(p)]
-    skater_df = calc_fantasy_points(build_stat_table(skaters, SKATER_CATEGORIES), SKATER_CATEGORIES)
-    goalie_df = calc_fantasy_points(build_stat_table(goalies, GOALIE_CATEGORIES), GOALIE_CATEGORIES)
-    return skater_df, goalie_df
-
-
 # ---------------- Tabs ----------------
 tab1, tab2, tab3 = st.tabs(["Draft Helper", "Waiver Wire", "My Team"])
 
 with tab1:
     st.subheader("Draft Helper")
-    st.caption(
-        "Ranks players by projected fantasy points using your league's exact "
-        "point values per stat (Head to Head Points scoring), based on last "
-        "season's totals. Check off players as they're drafted - by anyone - "
-        "to keep the board current."
-    )
-    if league is None:
-        st.info("Connect to your league in the sidebar first.")
+
+    if projections_loaded:
+        st.caption(
+            "Ranks players by projected fantasy points using your uploaded "
+            "2026-27 projections and your league's exact point values per stat. "
+            "Check off players as they're drafted - by anyone - to keep the board current."
+        )
+        skater_df, goalie_df = proj_skater_df, proj_goalie_df
+        data_source_ready = True
+    elif league is not None:
+        st.caption(
+            "No projections file uploaded, so this is falling back to ESPN's own "
+            "stats (last season's totals). Upload a projections spreadsheet in the "
+            "sidebar for more accurate, forward-looking rankings."
+        )
+        skater_df, goalie_df = get_ranked_pool_from_espn(league, year)
+        data_source_ready = True
     else:
-        skater_df, goalie_df = get_ranked_pool(league)
+        st.info("Upload a projections spreadsheet, or connect to your league, in the sidebar.")
+        data_source_ready = False
+
+    if data_source_ready:
         pos_filter = st.radio("Position", ["Skaters", "Goalies"], horizontal=True)
         df = skater_df if pos_filter == "Skaters" else goalie_df
         available_df = df[~df["name"].isin(st.session_state.drafted_names)]
 
-        st.write(f"**{len(available_df)} players still available**")
+        search_term = st.text_input("Search players", value="", placeholder="Type a player name...")
+        if search_term:
+            available_df = available_df[available_df["name"].str.contains(search_term, case=False, na=False)]
+
+        st.write(f"**{len(available_df)} players {'matching search' if search_term else 'still available'}**")
         for _, row in available_df.head(40).iterrows():
             cols = st.columns([0.5, 3, 1, 1, 5])
             with cols[0]:
@@ -175,11 +253,17 @@ with tab1:
 
 with tab2:
     st.subheader("Waiver Wire Targets")
-    st.caption("Same ranking logic, restricted to players currently on waivers/free agency.")
+    st.caption("Ranks players currently on waivers/free agency using ESPN's live stats.")
     if league is None:
         st.info("Connect to your league in the sidebar first.")
     else:
-        skater_df, goalie_df = get_ranked_pool(league, size=200)
+        skater_df, goalie_df = get_ranked_pool_from_espn(league, year, size=200)
+
+        waiver_search = st.text_input("Search players", value="", placeholder="Type a player name...", key="waiver_search")
+        if waiver_search:
+            skater_df = skater_df[skater_df["name"].str.contains(waiver_search, case=False, na=False)]
+            goalie_df = goalie_df[goalie_df["name"].str.contains(waiver_search, case=False, na=False)]
+
         st.write("**Top Skaters**")
         st.dataframe(skater_df[["name", "position", "value"] + SKATER_CATEGORIES].head(20), use_container_width=True)
         st.write("**Top Goalies**")
@@ -195,9 +279,9 @@ with tab3:
             st.error("Team not found. Available teams:")
             st.write([t.team_name for t in league.teams])
         else:
-            roster_df = build_stat_table(team.roster, SKATER_CATEGORIES + GOALIE_CATEGORIES)
+            roster_df = build_stat_table_from_espn(team.roster, SKATER_CATEGORIES + GOALIE_CATEGORIES, year)
             all_rosters = [p for t in league.teams for p in t.roster]
-            league_df = build_stat_table(all_rosters, SKATER_CATEGORIES + GOALIE_CATEGORIES)
+            league_df = build_stat_table_from_espn(all_rosters, SKATER_CATEGORIES + GOALIE_CATEGORIES, year)
 
             report_rows = []
             for cat in SKATER_CATEGORIES + GOALIE_CATEGORIES:
@@ -211,15 +295,10 @@ with tab3:
                     "League Avg/Team": round(league_avg, 1),
                 })
 
-            # DEF bonus: defensemen's own G+A scored again at 0.5 pts/point
-            is_def = roster_df["position"].apply(
-                lambda pos: str(pos).strip().upper() in ("D", "DEFENSE", "DEFENSEMAN")
-            )
+            is_def = roster_df["position"].apply(is_defenseman_label)
             my_def_bonus = ((roster_df["G"] + roster_df["A"]) * 0.5 * is_def).sum()
-            league_def_bonus_avg = (
-                (league_df["G"] + league_df["A"]) * 0.5
-                * league_df["position"].apply(lambda pos: str(pos).strip().upper() in ("D", "DEFENSE", "DEFENSEMAN"))
-            ).sum() / len(league.teams)
+            league_is_def = league_df["position"].apply(is_defenseman_label)
+            league_def_bonus_avg = ((league_df["G"] + league_df["A"]) * 0.5 * league_is_def).sum() / len(league.teams)
             report_rows.append({
                 "Category": "DEF (bonus)",
                 "Points/Stat": 0.5,
