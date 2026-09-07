@@ -12,6 +12,17 @@ Three tools in one app:
 Built for Smith's Hockey League (ESPN, Head to Head Points scoring):
   Skaters: G, A, +/-, PPP, SHP, SOG, HIT, BLK  (+ DEF bonus for defensemen)
   Goalies: W, GA, SV, SO, OTL
+
+Field glossary (also shown in-app via the "What do the badges mean?" expander):
+  - Name badge (+, ++, -, --): the source spreadsheet's own analyst
+    adjustment (analyst_adj column) -- a manual judgment-call tweak on top
+    of the statistical model, for cases like breakout candidates or players
+    who switched teams. "+" = bumped up a bit, "++" = bumped up more,
+    "-"/"--" = bumped down. This is the analysts' opinion, not our math.
+  - Value/Reach column (🔥 Value / ⚠️ Reach / plain +N or -N): compares each
+    player's ADP to their rank in OUR VORP-based board (adp_diff). Positive
+    means they're going later in drafts than our model says they're worth
+    (a sleeper); negative means they're going earlier (a reach risk).
 """
 
 import streamlit as st
@@ -373,6 +384,20 @@ tab1, tab2, tab3 = st.tabs(["Draft Helper", "Waiver Wire", "My Team"])
 
 with tab1:
     st.subheader("Draft Helper")
+
+    with st.expander("What do the badges mean?"):
+        st.markdown(
+            "- **Name badge (`+`, `++`, `-`, `--`)** -- the source spreadsheet's "
+            "own analyst adjustment: a manual judgment-call tweak on top of the "
+            "statistical model, for cases like breakout candidates or players who "
+            "switched teams. `+` = bumped up a bit, `++` = bumped up more, "
+            "`-`/`--` = bumped down. This reflects the analysts' opinion, not our math.\n"
+            "- **Value/Reach column** (🔥 Value / ⚠️ Reach / plain `+N` or `-N`) -- "
+            "compares a player's ADP to their rank in *our* VORP-based board. "
+            "Positive means they're going later in drafts than our model says "
+            "they're worth (a sleeper); negative means they're going earlier "
+            "(a reach risk)."
+        )
 
     if projections_loaded:
         st.caption(
