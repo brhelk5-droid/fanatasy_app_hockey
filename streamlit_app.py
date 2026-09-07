@@ -175,9 +175,6 @@ def compute_utility_adjusted_vorp(skater_df):
     return df, replacement_fp
 
 
-GOALIE_STARTER_SLOTS = 2  # per team, no Utility crossover for goalies
-
-
 def fetch_espn_adp(league, size=2000):
     """Best-effort pull of ESPN's own Average Draft Position per player.
 
@@ -329,6 +326,15 @@ if league is not None:
         except Exception as e:
             st.write(f"Could not read league.settings: {e}")
 
+espn_adp_by_name = {}
+if league is not None:
+    espn_adp_by_name = fetch_espn_adp(league)
+    if not espn_adp_by_name:
+        st.sidebar.info(
+            "ESPN ADP not available through this library for hockey -- "
+            "falling back to the spreadsheet's own ADP column."
+        )
+
 
 # ---------------- Tabs ----------------
 tab1, tab2, tab3 = st.tabs(["Draft Helper", "Waiver Wire", "My Team"])
@@ -378,6 +384,25 @@ with tab1:
         # Display multi-position eligibility as "LW/RW" instead of "LW,RW"
         combined_df["position_display"] = combined_df["position"].astype(str).str.replace(",", "/")
 
+        # ADP: prefer ESPN's own live ADP when available; otherwise fall back
+        # to whatever ADP is baked into the projections sheet (Yahoo's, in
+        # this case -- clearly labeled so it's never confused for ESPN's).
+        if espn_adp_by_name:
+            combined_df["adp"] = combined_df["name"].map(espn_adp_by_name)
+            combined_df["adp_source"] = combined_df["adp"].apply(lambda v: "ESPN" if pd.notna(v) else None)
+            if "sheet_adp" in combined_df.columns:
+                missing = combined_df["adp"].isna()
+                combined_df.loc[missing, "adp_source"] = combined_df.loc[missing, "sheet_adp"].apply(
+                    lambda v: "sheet" if pd.notna(v) else None
+                )
+                combined_df.loc[missing, "adp"] = combined_df.loc[missing, "sheet_adp"]
+        elif "sheet_adp" in combined_df.columns:
+            combined_df["adp"] = combined_df["sheet_adp"]
+            combined_df["adp_source"] = combined_df["adp"].apply(lambda v: "sheet" if pd.notna(v) else None)
+        else:
+            combined_df["adp"] = None
+            combined_df["adp_source"] = None
+
         available_df = combined_df[~combined_df["name"].isin(st.session_state.drafted_names)]
 
         ALL_POSITIONS = ["C", "LW", "RW", "D", "G"]
@@ -396,7 +421,7 @@ with tab1:
 
         st.write(f"**{len(available_df)} players {'matching search/filter' if (search_term or len(selected_positions) < len(ALL_POSITIONS)) else 'still available'}**")
         for _, row in available_df.head(40).iterrows():
-            cols = st.columns([0.5, 3, 1, 1, 5])
+            cols = st.columns([0.5, 2.5, 1, 1, 1.3, 1, 4])
             with cols[0]:
                 if st.button("Draft", key=f"draft_{row['name']}"):
                     st.session_state.drafted_names.add(row["name"])
@@ -408,6 +433,15 @@ with tab1:
             with cols[3]:
                 st.write(f"FP: {row['value']:.0f}")
             with cols[4]:
+                if pd.notna(row.get("adp")):
+                    src = row.get("adp_source") or ""
+                    st.write(f"ADP: {row['adp']:.1f}" + (f" ({src})" if src else ""))
+                else:
+                    st.write("ADP: n/a")
+            with cols[5]:
+                gp = row.get("GP")
+                st.write(f"GP: {gp:.0f}" if pd.notna(gp) else "GP: n/a")
+            with cols[6]:
                 is_goalie_row = str(row["position"]).strip().upper() == "G"
                 cats = GOALIE_CATEGORIES if is_goalie_row else SKATER_CATEGORIES
                 st.write(" | ".join(f"{c}: {row[c]:.0f}" for c in cats))
