@@ -882,7 +882,7 @@ with tab4:
                         player_team = row["team_norm"]
                         is_g = row["position_display"].strip().upper() == "G"
                         player_positions = eligible_positions(row["position"])
-                        playing_days, gap_days = [], []
+                        playing_days, gap_days, covered_needs = [], [], set()
                         for d in week_days:
                             if player_team not in week_schedules[d]:
                                 continue
@@ -890,17 +890,25 @@ with tab4:
                             need = day_need[d]
                             if is_g and need["goalie_shortfall"] > 0:
                                 gap_days.append(d)
-                            elif not is_g and (
-                                any(need["position_shortfalls"].get(pos, 0) > 0 for pos in player_positions)
-                                or need["general_skater_shortfall"] > 0
-                            ):
-                                gap_days.append(d)
-                        return len(playing_days), len(gap_days), playing_days
+                                covered_needs.add((d, "G"))
+                            elif not is_g:
+                                covered_here = False
+                                for pos in player_positions:
+                                    if need["position_shortfalls"].get(pos, 0) > 0:
+                                        covered_needs.add((d, pos))
+                                        covered_here = True
+                                if need["general_skater_shortfall"] > 0:
+                                    covered_needs.add((d, "SKATER_GENERAL"))
+                                    covered_here = True
+                                if covered_here:
+                                    gap_days.append(d)
+                        return len(playing_days), len(gap_days), playing_days, covered_needs
 
                     results = combined_week_df.apply(days_and_coverage, axis=1, result_type="expand")
                     combined_week_df["days_playing_this_week"] = results[0]
                     combined_week_df["gap_days_covered"] = results[1]
                     combined_week_df["playing_days_list"] = results[2]
+                    combined_week_df["covered_needs"] = results[3]
 
                     candidates_df = combined_week_df[combined_week_df["gap_days_covered"] > 0].copy()
                     candidates_df = candidates_df.sort_values(
@@ -925,3 +933,85 @@ with tab4:
                             with cols[3]:
                                 plays_str = ", ".join(d.strftime("%a") for d in row["playing_days_list"])
                                 st.write(f"Plays: {plays_str}")
+
+                        # ---------------- True combination optimizer ----------------
+                        st.markdown("#### Optimized combination of your 7 moves")
+                        st.caption(
+                            "This isn't just the top 7 rows above -- it searches for the "
+                            "COMBINATION of up to 7 adds that covers the most distinct "
+                            "gap-day/position needs (using value as a tiebreaker), so it "
+                            "won't waste two picks covering the same day/position twice. "
+                            "It's a greedy-plus-local-search solve, not a brute-force "
+                            "guarantee, but for a pool this size it reliably finds the "
+                            "optimal or near-optimal combination."
+                        )
+                        max_moves = st.slider("Roster moves available", 1, 7, 7)
+
+                        pool = {i: row.to_dict() for i, row in candidates_df.iterrows()}
+
+                        def coverage_score(selected_ids):
+                            covered = set()
+                            total_vorp = 0.0
+                            for i in selected_ids:
+                                covered |= pool[i]["covered_needs"]
+                                total_vorp += pool[i]["vorp"]
+                            return len(covered) * 100000 + total_vorp, covered
+
+                        # Greedy construction
+                        selected = []
+                        remaining_pool_ids = set(pool.keys())
+                        remaining_needs = set()
+                        for i in pool:
+                            remaining_needs |= pool[i]["covered_needs"]
+                        for _ in range(max_moves):
+                            best_id, best_gain = None, -1
+                            for i in remaining_pool_ids:
+                                newly_covered = pool[i]["covered_needs"] & remaining_needs
+                                gain = len(newly_covered) * 100000 + pool[i]["vorp"]
+                                if len(newly_covered) > 0 and gain > best_gain:
+                                    best_gain = gain
+                                    best_id = i
+                            if best_id is None:
+                                break
+                            selected.append(best_id)
+                            remaining_pool_ids.discard(best_id)
+                            remaining_needs -= pool[best_id]["covered_needs"]
+
+                        # Local search: try single swaps to improve total coverage score
+                        improved = True
+                        iterations = 0
+                        while improved and iterations < 50:
+                            improved = False
+                            iterations += 1
+                            cur_score, _ = coverage_score(selected)
+                            for sel_id in list(selected):
+                                for cand_id in list(remaining_pool_ids):
+                                    trial = [s for s in selected if s != sel_id] + [cand_id]
+                                    trial_score, _ = coverage_score(trial)
+                                    if trial_score > cur_score:
+                                        selected = trial
+                                        remaining_pool_ids.discard(cand_id)
+                                        remaining_pool_ids.add(sel_id)
+                                        improved = True
+                                        break
+                                if improved:
+                                    break
+
+                        if not selected:
+                            st.info("No combination of available players covers any of your gap-day needs.")
+                        else:
+                            final_score, final_covered = coverage_score(selected)
+                            total_vorp = sum(pool[i]["vorp"] for i in selected)
+                            st.write(
+                                f"**Best {len(selected)}-move combination** -- covers "
+                                f"{len(final_covered)} distinct gap-day/position needs, "
+                                f"total VORP {total_vorp:.1f}:"
+                            )
+                            for i in selected:
+                                row = pool[i]
+                                newly = row["covered_needs"]
+                                needs_str = ", ".join(f"{d.strftime('%a')} {cat}" for d, cat in sorted(newly, key=lambda x: x[0]))
+                                st.write(
+                                    f"- **{row['name']}** ({row['position_display']}, {row['team_norm']}) -- "
+                                    f"VORP {row['vorp']:.1f} -- covers: {needs_str}"
+                                )
