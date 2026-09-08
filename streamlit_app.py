@@ -783,3 +783,145 @@ with tab4:
                                     "available streaming options above, if you have a "
                                     "matching open spot."
                                 )
+
+        # ---------------- Weekly Planner ----------------
+        st.markdown("---")
+        st.subheader("Weekly Planner (Mon-Sun)")
+        st.caption(
+            "Finds days this week your active roster is short-handed at a "
+            "position, then ranks available players by how many of those "
+            "gap-days they'd actually cover -- since you only get 7 roster "
+            "moves a week, it's worth prioritizing adds that help the most "
+            "days rather than just the single best name."
+        )
+
+        if league is None or not my_team_name:
+            st.info("Connect to your league and enter your team name in the sidebar to use the Weekly Planner.")
+        else:
+            team = next((t for t in league.teams if t.team_name == my_team_name), None)
+            if team is None:
+                st.info("Team not found -- check your team name in the sidebar.")
+            elif "TEAM" not in proj_skater_df.columns and "TEAM" not in proj_goalie_df.columns:
+                st.error("Your player_projections.csv doesn't have a TEAM column -- re-upload the latest CSV to use this.")
+            else:
+                anchor_date = pick_date if "pick_date" in dir() else datetime.date.today()
+                monday = anchor_date - datetime.timedelta(days=anchor_date.weekday())
+                week_days = [monday + datetime.timedelta(days=i) for i in range(7)]
+                week_schedules = {d: fetch_teams_playing_on(d.strftime("%Y-%m-%d")) for d in week_days}
+
+                # My roster: name, eligible positions, team, goalie flag
+                my_roster_info = []
+                for p in team.roster:
+                    pos_list = eligible_positions(getattr(p, "position", ""))
+                    pro_team = normalize_team_abbrev(getattr(p, "proTeam", ""))
+                    my_roster_info.append({
+                        "name": p.name, "positions": pos_list, "team": pro_team, "is_goalie": is_goalie(p),
+                    })
+
+                # Per-day: how many of MY players at each position are playing,
+                # and where that falls short of what a full lineup needs.
+                day_need = {}
+                for d in week_days:
+                    teams_playing = week_schedules[d]
+                    counts = {"C": 0, "LW": 0, "RW": 0, "D": 0}
+                    goalie_count = 0
+                    skater_count = 0
+                    for pl in my_roster_info:
+                        if not teams_playing or pl["team"] not in teams_playing:
+                            continue
+                        if pl["is_goalie"]:
+                            goalie_count += 1
+                        else:
+                            skater_count += 1
+                            for pos in pl["positions"]:
+                                if pos in counts:
+                                    counts[pos] += 1
+                    shortfalls = {pos: max(0, DEDICATED_SKATER_SLOTS[pos] - counts[pos]) for pos in DEDICATED_SKATER_SLOTS}
+                    goalie_shortfall = max(0, GOALIE_STARTER_SLOTS - goalie_count)
+                    total_skater_slots = sum(DEDICATED_SKATER_SLOTS.values()) + UTIL_SLOTS_PER_TEAM
+                    general_skater_shortfall = max(0, total_skater_slots - skater_count)
+                    day_need[d] = {
+                        "position_shortfalls": shortfalls,
+                        "goalie_shortfall": goalie_shortfall,
+                        "general_skater_shortfall": general_skater_shortfall,
+                        "needs_help": any(v > 0 for v in shortfalls.values()) or goalie_shortfall > 0 or general_skater_shortfall > 0,
+                    }
+
+                st.write("**Day-by-day roster check:**")
+                day_cols = st.columns(7)
+                for i, d in enumerate(week_days):
+                    with day_cols[i]:
+                        label = d.strftime("%a %-m/%-d")
+                        if not week_schedules[d]:
+                            st.write(f"?  {label}")
+                            st.caption("no schedule data")
+                        elif day_need[d]["needs_help"]:
+                            gaps = [pos for pos, v in day_need[d]["position_shortfalls"].items() if v > 0]
+                            if day_need[d]["goalie_shortfall"] > 0:
+                                gaps.append("G")
+                            st.write(f"⚠️ **{label}**")
+                            st.caption(", ".join(gaps) if gaps else "short-handed")
+                        else:
+                            st.write(f"✅ {label}")
+
+                need_days = [d for d in week_days if day_need[d]["needs_help"]]
+                if not need_days:
+                    st.success("Your roster covers every day this week -- no streaming needed based on the current schedule data.")
+                else:
+                    combined_week_df = pd.concat([proj_skater_df, proj_goalie_df], ignore_index=True, sort=False)
+                    combined_week_df["team_norm"] = combined_week_df["TEAM"].apply(normalize_team_abbrev)
+                    combined_week_df["position_display"] = combined_week_df["position"].astype(str).str.replace(",", "/")
+                    owned_names_week = set()
+                    try:
+                        owned_names_week = {p.name for t in league.teams for p in t.roster}
+                    except Exception:
+                        pass
+                    combined_week_df = combined_week_df[~combined_week_df["name"].isin(owned_names_week)].copy()
+
+                    def days_and_coverage(row):
+                        player_team = row["team_norm"]
+                        is_g = row["position_display"].strip().upper() == "G"
+                        player_positions = eligible_positions(row["position"])
+                        playing_days, gap_days = [], []
+                        for d in week_days:
+                            if player_team not in week_schedules[d]:
+                                continue
+                            playing_days.append(d)
+                            need = day_need[d]
+                            if is_g and need["goalie_shortfall"] > 0:
+                                gap_days.append(d)
+                            elif not is_g and (
+                                any(need["position_shortfalls"].get(pos, 0) > 0 for pos in player_positions)
+                                or need["general_skater_shortfall"] > 0
+                            ):
+                                gap_days.append(d)
+                        return len(playing_days), len(gap_days), playing_days
+
+                    results = combined_week_df.apply(days_and_coverage, axis=1, result_type="expand")
+                    combined_week_df["days_playing_this_week"] = results[0]
+                    combined_week_df["gap_days_covered"] = results[1]
+                    combined_week_df["playing_days_list"] = results[2]
+
+                    candidates_df = combined_week_df[combined_week_df["gap_days_covered"] > 0].copy()
+                    candidates_df = candidates_df.sort_values(
+                        ["gap_days_covered", "vorp"], ascending=[False, False]
+                    ).reset_index(drop=True)
+
+                    if candidates_df.empty:
+                        st.info("No available players play on your gap days this week.")
+                    else:
+                        st.write(
+                            f"**Top streaming targets for the rest of the week** "
+                            f"(you get 7 roster moves/week -- prioritize the top rows first):"
+                        )
+                        for _, row in candidates_df.head(15).iterrows():
+                            cols = st.columns([2.3, 1.2, 1, 3])
+                            with cols[0]:
+                                st.write(f"**{row['name']}** ({row['position_display']}, {row['team_norm']})")
+                            with cols[1]:
+                                st.write(f"Gap days covered: {row['gap_days_covered']}")
+                            with cols[2]:
+                                st.write(f"VORP: {row['vorp']:.1f}")
+                            with cols[3]:
+                                plays_str = ", ".join(d.strftime("%a") for d in row["playing_days_list"])
+                                st.write(f"Plays: {plays_str}")
