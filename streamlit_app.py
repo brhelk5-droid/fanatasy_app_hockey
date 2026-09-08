@@ -28,6 +28,8 @@ Field glossary (also shown in-app via the "What do the badges mean?" expander):
 import streamlit as st
 import pandas as pd
 import os
+import requests
+import datetime
 from espn_api.hockey import League
 
 st.set_page_config(page_title="Fantasy Hockey Assistant", layout="wide")
@@ -44,6 +46,44 @@ POINT_VALUES = {
     # standalone stat, so it isn't a flat per-stat multiplier here.
     "W": 5, "GA": -3, "SV": 0.6, "SO": 5, "OTL": 2,
 }
+
+# The projections sheet uses a few non-standard team abbreviations
+# (dot-style for three-word city names); the NHL's own schedule API uses
+# the standard 3-letter codes. This reconciles the two so we can match a
+# player's team to whether they're playing on a given date.
+TEAM_ABBREV_TO_NHL_API = {
+    "L.A": "LAK", "N.J": "NJD", "S.J": "SJS", "T.B": "TBL",
+}
+
+
+def normalize_team_abbrev(team):
+    team = str(team).strip().upper()
+    return TEAM_ABBREV_TO_NHL_API.get(team, team)
+
+
+@st.cache_data(show_spinner="Checking NHL schedule...", ttl=3600)
+def fetch_teams_playing_on(date_str):
+    """Returns the set of (normalized) team abbreviations with a game on the
+    given YYYY-MM-DD date, using the NHL's own public schedule API. Returns
+    an empty set (and the UI shows a warning) if the request fails, rather
+    than crashing the tab.
+    """
+    try:
+        resp = requests.get(f"https://api-web.nhle.com/v1/schedule/{date_str}", timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        return set()
+    teams_today = set()
+    for week in data.get("gameWeek", []):
+        if week.get("date") != date_str:
+            continue
+        for game in week.get("games", []):
+            for side in ("awayTeam", "homeTeam"):
+                abbrev = game.get(side, {}).get("abbrev")
+                if abbrev:
+                    teams_today.add(normalize_team_abbrev(abbrev))
+    return teams_today
 
 
 # ---------------- Shared helpers ----------------
@@ -247,7 +287,7 @@ def load_projections_from_dataframe(raw_df):
     but only if that column is actually present; see compute_goalie_vorp_fallback.
     """
     keep_cols = ["NAME", "POS"] + SKATER_CATEGORIES + GOALIE_CATEGORIES
-    optional_cols = ["GP", "sheet_adp", "sheet_vorp", "analyst_adj"]
+    optional_cols = ["GP", "sheet_adp", "sheet_vorp", "analyst_adj", "TEAM"]
     missing_optional_cols = [c for c in optional_cols if c not in raw_df.columns]
     df = raw_df.copy()
     for col in keep_cols:
@@ -380,7 +420,7 @@ if league is not None:
 
 
 # ---------------- Tabs ----------------
-tab1, tab2, tab3 = st.tabs(["Draft Helper", "Waiver Wire", "My Team"])
+tab1, tab2, tab3, tab4 = st.tabs(["Draft Helper", "Waiver Wire", "My Team", "Streaming"])
 
 with tab1:
     st.subheader("Draft Helper")
@@ -590,3 +630,90 @@ with tab3:
             })
 
             st.dataframe(pd.DataFrame(report_rows), use_container_width=True)
+
+with tab4:
+    st.subheader("Streaming Helper")
+    st.caption(
+        "Shows which available players actually have a game on a given day -- "
+        "useful for deciding who to stream on your empty roster/Utility spots. "
+        "Ranked by the same VORP used in Draft Helper (season-long value), not "
+        "a day-specific projection, since we don't have per-game projections."
+    )
+
+    if not projections_loaded:
+        st.info("Player projections haven't loaded (see the sidebar) -- Streaming needs those to rank players.")
+    else:
+        pick_date = st.date_input("Date to check", value=datetime.date.today())
+        date_str = pick_date.strftime("%Y-%m-%d")
+        teams_today = fetch_teams_playing_on(date_str)
+
+        if not teams_today:
+            st.warning(
+                "Couldn't get today's schedule from the NHL's API (or there are no "
+                "games on this date -- normal for an off-day, or if the date is "
+                "outside the regular season)."
+            )
+        else:
+            st.write(f"**{len(teams_today)} teams play on {pick_date.strftime('%A, %B %-d')}:** " + ", ".join(sorted(teams_today)))
+
+            combined_stream_df = pd.concat([proj_skater_df, proj_goalie_df], ignore_index=True, sort=False)
+            if "TEAM" not in combined_stream_df.columns:
+                st.error("Your player_projections.csv doesn't have a TEAM column -- re-upload the latest CSV to use Streaming.")
+            else:
+                combined_stream_df["team_norm"] = combined_stream_df["TEAM"].apply(normalize_team_abbrev)
+                combined_stream_df["position_display"] = combined_stream_df["position"].astype(str).str.replace(",", "/")
+
+                # Figure out who's actually available (not rostered) if we can.
+                owned_names = set()
+                if league is not None:
+                    try:
+                        owned_names = {p.name for t in league.teams for p in t.roster}
+                    except Exception:
+                        owned_names = set()
+
+                playing_df = combined_stream_df[combined_stream_df["team_norm"].isin(teams_today)]
+                available_stream_df = playing_df[~playing_df["name"].isin(owned_names)]
+                available_stream_df = available_stream_df.sort_values("vorp", ascending=False).reset_index(drop=True)
+
+                if league is None:
+                    st.caption(
+                        "Not connected to your league, so this shows every player "
+                        "playing today (can't tell who's actually on waivers vs. "
+                        "already rostered) -- connect in the sidebar for a real list."
+                    )
+                else:
+                    st.write(f"**{len(available_stream_df)} available players play today**")
+
+                stream_search = st.text_input("Search players", value="", placeholder="Type a player name...", key="stream_search")
+                if stream_search:
+                    available_stream_df = available_stream_df[available_stream_df["name"].str.contains(stream_search, case=False, na=False)]
+
+                for _, row in available_stream_df.head(30).iterrows():
+                    cols = st.columns([2.5, 1, 1, 1])
+                    with cols[0]:
+                        st.write(f"**{row['name']}** ({row['position_display']}, {row['team_norm']})")
+                    with cols[1]:
+                        st.write(f"VORP: {row['vorp']:.1f}")
+                    with cols[2]:
+                        st.write(f"FP: {row['value']:.0f}")
+                    with cols[3]:
+                        gp = row.get("GP")
+                        st.write(f"GP: {gp:.0f}" if pd.notna(gp) else "")
+
+                # Cross-check: which of MY rostered players do NOT play today?
+                if league is not None and my_team_name:
+                    team = next((t for t in league.teams if t.team_name == my_team_name), None)
+                    if team is not None:
+                        my_names_teams = []
+                        for p in team.roster:
+                            pro_team = normalize_team_abbrev(getattr(p, "proTeam", ""))
+                            my_names_teams.append((p.name, pro_team))
+                        sitting_today = [n for n, t in my_names_teams if t and t not in teams_today]
+                        if sitting_today:
+                            with st.expander(f"Your roster NOT playing today ({len(sitting_today)})"):
+                                st.write(", ".join(sitting_today))
+                                st.caption(
+                                    "These are candidates to bench in favor of one of the "
+                                    "available streaming options above, if you have a "
+                                    "matching open spot."
+                                )
