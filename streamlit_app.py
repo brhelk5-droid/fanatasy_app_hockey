@@ -141,6 +141,21 @@ def player_stat(stats_dict, stat_key):
         return 0.0
 
 
+def get_recent_form_stats_dict(player):
+    """Best-effort pull of a 'recent form' stat split (last 7/15/30 days) from
+    ESPN's Player object. ESPN's fantasy API exposes these splits reliably
+    for football/basketball; hockey support in this library is documented as
+    still 'in development', so this may return None for every player --
+    callers must treat None as "not available" rather than "value of 0".
+    """
+    stats = getattr(player, "stats", {}) or {}
+    for window in ("last_7", "last_15", "last_30", "last7", "last15", "last30"):
+        for key in stats.keys():
+            if window in str(key).lower():
+                return stats[key] or {}
+    return None
+
+
 def build_stat_table_from_espn(players, categories, year):
     columns = ["name", "position"] + categories
     rows = []
@@ -635,9 +650,7 @@ with tab4:
     st.subheader("Streaming Helper")
     st.caption(
         "Shows which available players actually have a game on a given day -- "
-        "useful for deciding who to stream on your empty roster/Utility spots. "
-        "Ranked by the same VORP used in Draft Helper (season-long value), not "
-        "a day-specific projection, since we don't have per-game projections."
+        "useful for deciding who to stream on your empty roster/Utility spots."
     )
 
     if not projections_loaded:
@@ -663,6 +676,15 @@ with tab4:
                 combined_stream_df["team_norm"] = combined_stream_df["TEAM"].apply(normalize_team_abbrev)
                 combined_stream_df["position_display"] = combined_stream_df["position"].astype(str).str.replace(",", "/")
 
+                # Per-game rate: for a single stream night, what a player
+                # does PER GAME matters more than their season-long total --
+                # a player projected for fewer total games can still be the
+                # better one-night play if their per-game rate is higher.
+                combined_stream_df["value_per_game"] = combined_stream_df.apply(
+                    lambda r: r["value"] / r["GP"] if pd.notna(r.get("GP")) and r["GP"] > 0 else float("nan"),
+                    axis=1,
+                )
+
                 # Figure out who's actually available (not rostered) if we can.
                 owned_names = set()
                 if league is not None:
@@ -672,8 +694,48 @@ with tab4:
                         owned_names = set()
 
                 playing_df = combined_stream_df[combined_stream_df["team_norm"].isin(teams_today)]
-                available_stream_df = playing_df[~playing_df["name"].isin(owned_names)]
-                available_stream_df = available_stream_df.sort_values("vorp", ascending=False).reset_index(drop=True)
+                available_stream_df = playing_df[~playing_df["name"].isin(owned_names)].copy()
+
+                # Best-effort recent-form (last 15 days) pull from ESPN, only
+                # for the players actually in play here -- not the whole pool,
+                # to keep this fast. Honestly reports if the library doesn't
+                # have it for hockey rather than showing misleading zeros.
+                recent_form_by_name = {}
+                recent_form_checked = False
+                if league is not None and not available_stream_df.empty:
+                    recent_form_checked = True
+                    try:
+                        espn_pool = league.free_agents(size=2000)
+                        espn_by_name = {p.name: p for p in espn_pool}
+                        for _, r in available_stream_df.iterrows():
+                            p = espn_by_name.get(r["name"])
+                            if p is None:
+                                continue
+                            form_stats = get_recent_form_stats_dict(p)
+                            if form_stats is None:
+                                continue
+                            cats = GOALIE_CATEGORIES if r["position_display"].strip().upper() == "G" else SKATER_CATEGORIES
+                            form_value = sum(player_stat(form_stats, c) * POINT_VALUES[c] for c in cats)
+                            recent_form_by_name[r["name"]] = form_value
+                    except Exception:
+                        pass
+                available_stream_df["recent_form"] = available_stream_df["name"].map(recent_form_by_name)
+                recent_form_available = len(recent_form_by_name) > 0
+
+                sort_options = ["Per-game rate", "Season VORP"]
+                if recent_form_available:
+                    sort_options.append("Recent form (last 15 days)")
+                sort_choice = st.radio("Rank by", sort_options, horizontal=True)
+
+                if recent_form_checked and not recent_form_available:
+                    st.caption(
+                        "Tried pulling recent-form (last 15 days) stats from ESPN, "
+                        "but this library doesn't appear to expose that split for "
+                        "hockey players -- ranking by per-game rate and season VORP instead."
+                    )
+
+                sort_col = {"Per-game rate": "value_per_game", "Season VORP": "vorp", "Recent form (last 15 days)": "recent_form"}[sort_choice]
+                available_stream_df = available_stream_df.sort_values(sort_col, ascending=False, na_position="last").reset_index(drop=True)
 
                 if league is None:
                     st.caption(
@@ -689,16 +751,20 @@ with tab4:
                     available_stream_df = available_stream_df[available_stream_df["name"].str.contains(stream_search, case=False, na=False)]
 
                 for _, row in available_stream_df.head(30).iterrows():
-                    cols = st.columns([2.5, 1, 1, 1])
+                    cols = st.columns([2.3, 1, 1, 1, 1.2])
                     with cols[0]:
                         st.write(f"**{row['name']}** ({row['position_display']}, {row['team_norm']})")
                     with cols[1]:
-                        st.write(f"VORP: {row['vorp']:.1f}")
+                        vpg = row.get("value_per_game")
+                        st.write(f"FP/GP: {vpg:.1f}" if pd.notna(vpg) else "FP/GP: n/a")
                     with cols[2]:
-                        st.write(f"FP: {row['value']:.0f}")
+                        st.write(f"VORP: {row['vorp']:.1f}")
                     with cols[3]:
                         gp = row.get("GP")
-                        st.write(f"GP: {gp:.0f}" if pd.notna(gp) else "")
+                        st.write(f"GP: {gp:.0f}" if pd.notna(gp) else "GP: n/a")
+                    with cols[4]:
+                        rf = row.get("recent_form")
+                        st.write(f"L15: {rf:.1f}" if pd.notna(rf) else "")
 
                 # Cross-check: which of MY rostered players do NOT play today?
                 if league is not None and my_team_name:
